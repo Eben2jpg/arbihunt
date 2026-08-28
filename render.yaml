@@ -1,0 +1,74 @@
+# Render Blueprint for ArbiHunt
+# Deploy: render.com -> New -> Blueprint -> point at this repo.
+# Renders one Web Service from /server. The /client is hosted on Vercel
+# (see vercel.json) so the React app and the long-running Node scanner
+# each get the platform that fits them.
+#
+# NOTE: render.yaml syntax is YAML 1.2. Indentation matters.
+
+services:
+  - type: web
+    name: arbihunt-server
+    runtime: node
+    rootDir: server
+    plan: free
+    region: oregon
+    # Run from the existing src/index.js entrypoint. The ws WebSocket
+    # upgrade path requires a long-lived process, which Render Web
+    # Services provide (serverless functions do not).
+    startCommand: node src/index.js
+    buildCommand: npm install
+    healthCheckPath: /api/health
+    autoDeploy: true
+
+    envVars:
+      # Required: a long random string. Generate with: openssl rand -hex 32
+      - key: JWT_SECRET
+        generateValue: true
+      - key: NODE_ENV
+        value: production
+      # Where the React app is hosted. Update this after Vercel gives
+      # you a URL, then redeploy.
+      - key: CLIENT_ORIGIN
+        value: https://arbihunt.vercel.app
+      # Bind to all interfaces inside the container.
+      - key: HOST
+        value: 0.0.0.0
+      # Optional owner email so the in-app owner panel works.
+      - key: OWNER_EMAIL
+        sync: false
+      # USDT receiving addresses (public, fine to put here).
+      - key: USDT_TRON_ADDRESS
+        sync: false
+      - key: USDT_BSC_ADDRESS
+        sync: false
+      # Block explorer keys for transaction monitoring.
+      - key: TRONGRID_API_KEY
+        sync: false
+      - key: BSCSCAN_API_KEY
+        sync: false
+      # Email (Resend). Leave blank in production; the forgot-password
+      # endpoint will then refuse to expose the reset code in the response.
+      - key: RESEND_API_KEY
+        sync: false
+      - key: EMAIL_FROM
+        value: "ArbiHunt <noreply@example.com>"
+      # Force production reset-code flow even if RESEND_API_KEY is blank.
+      - key: RESET_CODE_EXPOSED
+        value: "false"
+      # Demo seed is permanently off in production.
+      - key: ENABLE_DEMO_SEED
+        value: "false"
+      # Scanner tuning.
+      - key: SCAN_INTERVAL_MS
+        value: "25000"
+      - key: MAX_OPPORTUNITIES
+        value: "1000"
+
+    # The free tier restarts on disk loss. We persist /opt/render/project/src/data
+    # so the JSON DB fallback survives restarts. The persistent disk is
+    # mounted at /data and the server is configured to write there.
+    disk:
+      name: arbihunt-data
+      mountPath: /data
+      sizeGB: 1

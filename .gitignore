@@ -1,0 +1,17 @@
+node_modules/
+dist/
+build/
+.env
+*.log
+*.err.log
+*.out.log
+*.out.log
+_run_*.log
+_srv*.log
+_client*.log
+_server*.log
+.DS_Store
+data/
+coverage/
+.vscode/
+.idea/
