@@ -10,19 +10,24 @@ router.get('/exchanges', (_req, res) => {
 });
 
 // Public platform stats: how many users, scans, tokens, exchanges scanned.
-router.get('/stats', (_req, res) => {
-  const { count, lastScanAt, scansDone, tokens, durationMs, exchanges: scanned, scannedExchanges } = getScanStats();
-  res.json({
-    users: getUserCounts(),
-    opportunities: count,
-    lastScanAt,
-    scansDone,
-    tokens,
-    durationMs,
-    exchangesScanned: scanned,
-    scannedExchanges,
-    exchangesTotal: exchanges.length,
-  });
+router.get('/stats', async (_req, res) => {
+  try {
+    const { count, lastScanAt, scansDone, tokens, durationMs, exchanges: scanned, scannedExchanges } = getScanStats();
+    res.json({
+      users: await getUserCounts(),
+      opportunities: count,
+      lastScanAt,
+      scansDone,
+      tokens,
+      durationMs,
+      exchangesScanned: scanned,
+      scannedExchanges,
+      exchangesTotal: exchanges.length,
+    });
+  } catch (e) {
+    console.error('[status] stats error:', e?.message || e);
+    res.status(500).json({ error: 'Could not load stats' });
+  }
 });
 
 export default router;

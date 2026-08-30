@@ -18,15 +18,19 @@ export function verifyToken(token) {
   }
 }
 
-export function authRequired(req, res, next) {
-  const header = req.headers.authorization || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
-  const userId = token && verifyToken(token);
-  if (!userId) return res.status(401).json({ error: 'Not authenticated' });
-  const user = getUserById(userId);
-  if (!user) return res.status(401).json({ error: 'Account not found' });
-  req.user = user;
-  next();
+export async function authRequired(req, res, next) {
+  try {
+    const header = req.headers.authorization || '';
+    const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+    const userId = token && verifyToken(token);
+    if (!userId) return res.status(401).json({ error: 'Not authenticated' });
+    const user = await getUserById(userId);
+    if (!user) return res.status(401).json({ error: 'Account not found' });
+    req.user = user;
+    next();
+  } catch (e) {
+    next(e);
+  }
 }
 
 export function proRequired(req, res, next) {

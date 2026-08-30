@@ -35,11 +35,11 @@ export async function loadMarkets(exchange) {
   }
 }
 
-export function cacheMarkets(exchangeId, markets) {
-  cacheMarketsToDb(exchangeId, markets);
+export async function cacheMarkets(exchangeId, markets) {
+  await cacheMarketsToDb(exchangeId, markets);
 }
 
-export function getCachedMarkets(exchangeId) {
+export async function getCachedMarkets(exchangeId) {
   return getCachedMarketsFromDb(exchangeId);
 }
 

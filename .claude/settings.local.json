@@ -40,7 +40,11 @@
       "Bash(powershell -NoProfile -Command \"Get-Process node -ErrorAction SilentlyContinue | Select-Object Id, ProcessName, StartTime\")",
       "Bash(powershell -NoProfile -Command \"Get-Process node -ErrorAction SilentlyContinue | Stop-Process -Force; Start-Sleep -Seconds 2\")",
       "Bash(echo \"=== all users in DB ===\")",
-      "Bash(echo \"=== /ticker \\(current state\\) ===\")"
+      "Bash(echo \"=== /ticker \\(current state\\) ===\")",
+      "Bash(npm test *)",
+      "Bash(git check-ignore *)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(git add *)"
     ]
   }
 }

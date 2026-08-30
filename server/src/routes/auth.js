@@ -14,112 +14,124 @@ const resetLimiter = rateLimit({ windowMs: 60_000, max: 5 });
 
 const router = express.Router();
 
-router.post('/register', authLimiter, (req, res) => {
-  const { email, password, referredBy } = req.body || {};
-  if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
-  if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
-  if (getUserByEmail(email)) return res.status(409).json({ error: 'Email already registered' });
+router.post('/register', authLimiter, async (req, res) => {
+  try {
+    const { email, password, referredBy } = req.body || {};
+    if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+    if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
+    if (await getUserByEmail(email)) return res.status(409).json({ error: 'Email already registered' });
 
-  const user = createUser({ email, passwordHash: hashPassword(password), referredBy });
-  const token = makeToken(user.id);
-  res.json({ token, user: serializeUser(user) });
+    const user = await createUser({ email, passwordHash: hashPassword(password), referredBy });
+    const token = makeToken(user.id);
+    res.json({ token, user: serializeUser(user) });
+  } catch (e) { res.status(500).json({ error: 'Registration failed' }); }
 });
 
-router.post('/login', authLimiter, (req, res) => {
-  const { email, password } = req.body || {};
-  const user = getUserByEmail(email);
-  if (!user || !verifyPassword(password, user.password_hash)) {
-    return res.status(401).json({ error: 'Invalid email or password' });
-  }
-  const token = makeToken(user.id);
-  res.json({ token, user: serializeUser(user) });
+router.post('/login', authLimiter, async (req, res) => {
+  try {
+    const { email, password } = req.body || {};
+    const user = await getUserByEmail(email);
+    if (!user || !verifyPassword(password, user.password_hash)) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+    const token = makeToken(user.id);
+    res.json({ token, user: serializeUser(user) });
+  } catch (e) { res.status(500).json({ error: 'Login failed' }); }
 });
 
-router.post('/change-password', authRequired, (req, res) => {
-  const { currentPassword, newPassword } = req.body || {};
-  if (!currentPassword || !newPassword) {
-    return res.status(400).json({ error: 'Current and new password are required' });
-  }
-  if (newPassword.length < 8) {
-    return res.status(400).json({ error: 'New password must be at least 8 characters' });
-  }
-  if (newPassword === currentPassword) {
-    return res.status(400).json({ error: 'New password must be different from the current one' });
-  }
-  if (!verifyPassword(currentPassword, req.user.password_hash)) {
-    return res.status(401).json({ error: 'Current password is incorrect' });
-  }
-  resetUserPassword(req.user.email, hashPassword(newPassword));
-  res.json({ ok: true, message: 'Password updated successfully' });
+router.post('/change-password', authRequired, async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body || {};
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({ error: 'Current and new password are required' });
+    }
+    if (newPassword.length < 8) {
+      return res.status(400).json({ error: 'New password must be at least 8 characters' });
+    }
+    if (newPassword === currentPassword) {
+      return res.status(400).json({ error: 'New password must be different from the current one' });
+    }
+    if (!verifyPassword(currentPassword, req.user.password_hash)) {
+      return res.status(401).json({ error: 'Current password is incorrect' });
+    }
+    await resetUserPassword(req.user.email, hashPassword(newPassword));
+    res.json({ ok: true, message: 'Password updated successfully' });
+  } catch (e) { res.status(500).json({ error: 'Password change failed' }); }
 });
 
-router.get('/me', (req, res) => {
-  const header = req.headers.authorization || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
-  if (!token) return res.status(401).json({ error: 'Not authenticated' });
-  const userId = verifyToken(token);
-  if (!userId) return res.status(401).json({ error: 'Invalid token' });
-  const user = getUserById(userId);
-  if (!user) return res.status(401).json({ error: 'Account not found' });
-  res.json({ user: serializeUser(user) });
+router.get('/me', async (req, res) => {
+  try {
+    const header = req.headers.authorization || '';
+    const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+    if (!token) return res.status(401).json({ error: 'Not authenticated' });
+    const userId = verifyToken(token);
+    if (!userId) return res.status(401).json({ error: 'Invalid token' });
+    const user = await getUserById(userId);
+    if (!user) return res.status(401).json({ error: 'Account not found' });
+    res.json({ user: serializeUser(user) });
+  } catch (e) { res.status(500).json({ error: 'Auth check failed' }); }
 });
 
 router.post('/forgot-password', resetLimiter, async (req, res) => {
-  const email = String((req.body?.email || '').trim()).toLowerCase();
-  if (!email) return res.status(400).json({ error: 'Email required' });
+  try {
+    const email = String((req.body?.email || '').trim()).toLowerCase();
+    if (!email) return res.status(400).json({ error: 'Email required' });
 
-  const user = getUserByEmail(email);
-  // Always respond the same to avoid leaking which emails exist.
-  if (!user) return res.json({ ok: true, message: 'If an account exists for that email, a reset code has been issued.' });
+    const user = await getUserByEmail(email);
+    // Always respond the same to avoid leaking which emails exist.
+    if (!user) return res.json({ ok: true, message: 'If an account exists for that email, a reset code has been issued.' });
 
-  // Short-lived reset code (15 minutes). In dev mode the code is returned in the
-  // response; in production it should be delivered via email/SMS out-of-band.
-  const code = randomToken(3).toUpperCase();
-  setPasswordReset(email, code, Date.now() + 15 * 60 * 1000);
-  console.log(`[auth] reset code issued for ${email} (expires in 15m)`);
+    // Short-lived reset code (15 minutes). In dev mode the code is returned in the
+    // response; in production it should be delivered via email/SMS out-of-band.
+    const code = randomToken(3).toUpperCase();
+    await setPasswordReset(email, code, Date.now() + 15 * 60 * 1000);
+    console.log(`[auth] reset code issued for ${email} (expires in 15m)`);
 
-  // Try to send the code via email. If a real sender is configured, the
-  // response NEVER includes the code (devMode=false, resetCode=undefined).
-  // In dev (no sender), the code is returned so the local flow still works.
-  let delivered = false;
-  if (config.email.resendApiKey) {
-    const msg = passwordResetEmail({ email, code });
-    const result = await sendEmail({ to: email, subject: msg.subject, html: msg.html, text: msg.text });
-    delivered = !!result.ok;
-  }
+    // Try to send the code via email. If a real sender is configured, the
+    // response NEVER includes the code (devMode=false, resetCode=undefined).
+    // In dev (no sender), the code is returned so the local flow still works.
+    let delivered = false;
+    if (config.email.resendApiKey) {
+      const msg = passwordResetEmail({ email, code });
+      const result = await sendEmail({ to: email, subject: msg.subject, html: msg.html, text: msg.text });
+      delivered = !!result.ok;
+    }
 
-  res.json({
-    ok: true,
-    message: delivered
-      ? 'A reset code has been emailed to you. It expires in 15 minutes.'
-      : (config.resetCodeExposed
-          ? 'If an account exists for that email, a reset code has been issued.'
-          : 'We could not email a reset code right now. Please try again in a minute.'),
-    resetCode: config.resetCodeExposed ? code : undefined,
-    devMode: !!config.resetCodeExposed,
-  });
+    res.json({
+      ok: true,
+      message: delivered
+        ? 'A reset code has been emailed to you. It expires in 15 minutes.'
+        : (config.resetCodeExposed
+            ? 'If an account exists for that email, a reset code has been issued.'
+            : 'We could not email a reset code right now. Please try again in a minute.'),
+      resetCode: config.resetCodeExposed ? code : undefined,
+      devMode: !!config.resetCodeExposed,
+    });
+  } catch (e) { res.status(500).json({ error: 'Reset request failed' }); }
 });
 
-router.post('/reset-password', resetLimiter, (req, res) => {
-  const email = String((req.body?.email || '').trim()).toLowerCase();
-  const code = String((req.body?.code || '').trim()).toUpperCase();
-  const { newPassword } = req.body || {};
-  if (!email || !code || !newPassword) {
-    return res.status(400).json({ error: 'Email, reset code and new password are required' });
-  }
-  if (newPassword.length < 8) {
-    return res.status(400).json({ error: 'New password must be at least 8 characters' });
-  }
+router.post('/reset-password', resetLimiter, async (req, res) => {
+  try {
+    const email = String((req.body?.email || '').trim()).toLowerCase();
+    const code = String((req.body?.code || '').trim()).toUpperCase();
+    const { newPassword } = req.body || {};
+    if (!email || !code || !newPassword) {
+      return res.status(400).json({ error: 'Email, reset code and new password are required' });
+    }
+    if (newPassword.length < 8) {
+      return res.status(400).json({ error: 'New password must be at least 8 characters' });
+    }
 
-  const user = getUserByEmail(email);
-  const byCode = getUserByResetCode(code);
-  if (!user || !byCode || byCode.id !== user.id) {
-    return res.status(400).json({ error: 'Invalid or expired reset code' });
-  }
+    const user = await getUserByEmail(email);
+    const byCode = await getUserByResetCode(code);
+    if (!user || !byCode || byCode.id !== user.id) {
+      return res.status(400).json({ error: 'Invalid or expired reset code' });
+    }
 
-  resetUserPassword(email, hashPassword(newPassword));
-  clearPasswordReset(email);
-  res.json({ ok: true, message: 'Password updated. You can now log in.' });
+    await resetUserPassword(email, hashPassword(newPassword));
+    await clearPasswordReset(email);
+    res.json({ ok: true, message: 'Password updated. You can now log in.' });
+  } catch (e) { res.status(500).json({ error: 'Password reset failed' }); }
 });
 
 function serializeUser(user) {

@@ -37,6 +37,12 @@ services:
       # Optional owner email so the in-app owner panel works.
       - key: OWNER_EMAIL
         sync: false
+      # Supabase Postgres connection string. When set, the server uses
+      # Supabase instead of the local JSON/SQLite file store. Render's
+      # free tier has no persistent disk, so this is the only way to
+      # keep user data durable.
+      - key: SUPABASE_DB_URL
+        sync: false
       # USDT receiving addresses (public, fine to put here).
       - key: USDT_TRON_ADDRESS
         sync: false

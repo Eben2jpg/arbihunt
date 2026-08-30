@@ -8,7 +8,7 @@ import { fetchTronTransfers, fetchBscTransfers, getLatestBlockNumber, getConfirm
 import { getPendingPayments, updatePaymentStatus } from './db.js';
 import { activatePayment } from './payments/activate.js';
 import { liveExchanges as exchanges } from './scanner/exchanges.js';
-import { loadMarkets as loadExchangeMarkets, cacheMarkets as cacheMarketsToDb, getCachedMarkets as getCachedFromDb } from './scanner/markets.js';
+import { loadMarkets as loadExchangeMarkets, cacheMarkets as cacheMarketsToDb } from './scanner/markets.js';
 import { refreshLiveFees, liveFeesStats } from './scanner/liveFees.js';
 
 const app = express();
@@ -166,7 +166,7 @@ async function prewarmMarketCache() {
       try {
         const markets = await loadExchangeMarkets(ex.client);
         if (markets && markets.length) {
-          cacheMarketsToDb(ex.id, markets);
+          await cacheMarketsToDb(ex.id, markets);
           // Seed the in-memory universe with these bases immediately.
           for (const m of markets) lastUniverse.add(m.base);
           console.log(`[prewarm] ${ex.id}: ${markets.length} USDT markets cached`);
@@ -181,7 +181,7 @@ startScanner();
 
 async function monitorPayments() {
   try {
-    const invoices = getPendingPayments();
+    const invoices = await getPendingPayments();
     for (const inv of invoices) {
       try {
         let txs = [];
@@ -197,11 +197,11 @@ async function monitorPayments() {
         const tip = await getLatestBlockNumber(inv.network);
         const confs = getConfirmations(tip, matching.blockNumber);
         if (confs < required) {
-          updatePaymentStatus(inv.id, { confirmations: confs, tx_hash: matching.tx_hash, tx_amount: paid });
+          await updatePaymentStatus(inv.id, { confirmations: confs, tx_hash: matching.tx_hash, tx_amount: paid });
           continue;
         }
 
-        activatePayment(inv, { confirmations: confs, txHash: matching.tx_hash, amount: paid });
+        await activatePayment(inv, { confirmations: confs, txHash: matching.tx_hash, amount: paid });
       } catch (e) {
         console.warn('[payment] monitor error', e.message);
       }

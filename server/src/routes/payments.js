@@ -7,26 +7,36 @@ import { config } from '../config.js';
 
 const router = express.Router();
 
-router.get('/invoices', authRequired, (req, res) => {
-  const rows = getPaymentsByUser(req.user.id);
-  res.json({ invoices: rows.map((r) => ({
-    id: r.id,
-    code: r.invoice_code,
-    network: r.network,
-    toAddress: r.to_address,
-    amountUsd: r.amount_usd,
-    plan: r.plan,
-    status: r.status,
-    txHash: r.tx_hash,
-    confirmations: r.confirmations,
-    createdAt: r.created_at,
-    paidAt: r.paid_at,
-  })) });
+router.get('/invoices', authRequired, async (req, res) => {
+  try {
+    const rows = await getPaymentsByUser(req.user.id);
+    res.json({ invoices: rows.map((r) => ({
+      id: r.id,
+      code: r.invoice_code,
+      network: r.network,
+      toAddress: r.to_address,
+      amountUsd: r.amount_usd,
+      plan: r.plan,
+      status: r.status,
+      txHash: r.tx_hash,
+      confirmations: r.confirmations,
+      createdAt: r.created_at,
+      paidAt: r.paid_at,
+    })) });
+  } catch (e) {
+    console.error('[payments] invoices error:', e?.message || e);
+    res.status(500).json({ error: 'Could not load invoices' });
+  }
 });
 
-router.get('/status', authRequired, (req, res) => {
-  const user = getUserById(req.user.id);
-  res.json({ plan: isPro(user) ? 'pro' : 'free', planExpiresAt: user.plan_expires_at });
+router.get('/status', authRequired, async (req, res) => {
+  try {
+    const user = await getUserById(req.user.id);
+    res.json({ plan: isPro(user) ? 'pro' : 'free', planExpiresAt: user.plan_expires_at });
+  } catch (e) {
+    console.error('[payments] status error:', e?.message || e);
+    res.status(500).json({ error: 'Could not load plan status' });
+  }
 });
 
 // Manual confirmation: the user submits their TX hash (TXID) after sending USDT.
@@ -37,7 +47,7 @@ router.post('/verify', authRequired, async (req, res) => {
     return res.status(400).json({ error: 'invoiceCode and txHash are required' });
   }
 
-  const rows = getPaymentsByUser(req.user.id);
+  const rows = await getPaymentsByUser(req.user.id);
   const inv = rows.find((p) => String(p.invoice_code).toLowerCase() === String(invoiceCode).toLowerCase())
     || rows.find((p) => String(p.id) === String(invoiceCode));
   if (!inv) return res.status(404).json({ error: 'Invoice not found' });
@@ -71,11 +81,11 @@ router.post('/verify', authRequired, async (req, res) => {
   } catch (_e) { /* keep opt-in behavior on block lookup failure */ }
 
   if (confs < required) {
-    updatePaymentStatus(inv.id, { confirmations: confs, tx_hash: tx.tx_hash, tx_amount: paid });
+    await updatePaymentStatus(inv.id, { confirmations: confs, tx_hash: tx.tx_hash, tx_amount: paid });
     return res.json({ found: true, verified: false, confirmations: confs, required, message: `Payment detected! Waiting for confirmations (${confs}/${required}).` });
   }
 
-  const result = activatePayment(inv, { confirmations: confs, txHash: tx.tx_hash, amount: paid });
+  const result = await activatePayment(inv, { confirmations: confs, txHash: tx.tx_hash, amount: paid });
   res.json({ found: true, verified: true, plan: 'pro', expiresAt: result.expiresAt, message: 'Payment confirmed — your PRO is now active!' });
 });
 

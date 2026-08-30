@@ -299,7 +299,7 @@ export async function runScan(config, options = {}) {
       // back to the on-disk cache if the live call returns nothing or
       // times out. This is what keeps a network-restricted host scanning
       // the full universe from the last good state.
-      const cached = getCachedMarkets(ex.id) || [];
+      const cached = (await getCachedMarkets(ex.id)) || [];
       let markets = null;
       try {
         const live = await Promise.race([
@@ -308,7 +308,7 @@ export async function runScan(config, options = {}) {
         ]);
         if (Array.isArray(live) && live.length > 0) {
           markets = live;
-          cacheMarkets(ex.id, live);
+          await cacheMarkets(ex.id, live);
         } else {
           markets = cached;
           if (cached.length) console.log(`[markets] ${ex.id}: live empty, using cache (${cached.length})`);
@@ -467,7 +467,7 @@ export async function runScan(config, options = {}) {
     lastExchanges = Object.keys(booksByExchange).length;
     lastScannedExchanges = Object.keys(booksByExchange);
 
-    addScanHistory(latestOpportunities.length, durationMs, Object.keys(booksByExchange).length);
+    addScanHistory(latestOpportunities.length, durationMs, Object.keys(booksByExchange).length).catch((e) => console.warn('[scan] addScanHistory failed:', e?.message || e));
     console.log(`[scan] ${latestOpportunities.length} opps from ${universe.length} tokens in ${durationMs}ms`);
     return { opportunities: latestOpportunities, durationMs, exchanges: Object.keys(booksByExchange).length, tokens: universe.length };
   } finally {
