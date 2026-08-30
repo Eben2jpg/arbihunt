@@ -71,10 +71,7 @@ services:
       - key: MAX_OPPORTUNITIES
         value: "1000"
 
-    # The free tier restarts on disk loss. We persist /opt/render/project/src/data
-    # so the JSON DB fallback survives restarts. The persistent disk is
-    # mounted at /data and the server is configured to write there.
-    disk:
-      name: arbihunt-data
-      mountPath: /data
-      sizeGB: 1
+    # No persistent disk: Render's free tier rejects it ("disks are not
+    # supported for free tier services"). User data durability is
+    # provided by Supabase Postgres (see SUPABASE_DB_URL above); the
+    # JSON store only serves as a final-fallback when no DB is configured.
