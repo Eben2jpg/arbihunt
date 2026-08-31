@@ -2,7 +2,7 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "buildCommand": "npm run build --workspace client",
   "outputDirectory": "client/dist",
-  "installCommand": "npm install --workspaces=false --include-workspace-root",
+  "installCommand": "npm install --workspaces=false --include-workspace-root --foreground-scripts",
   "framework": null,
   "rewrites": [
     { "source": "/(.*)", "destination": "/index.html" }
