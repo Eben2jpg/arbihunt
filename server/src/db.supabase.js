@@ -53,7 +53,16 @@ try {
   ipv4Host = addrs[0];
   console.log(`[db:supabase] resolved ${u.hostname} -> ${ipv4Host}`);
 } catch (e) {
-  throw new Error(`[db:supabase] failed to resolve ${u.hostname} to IPv4: ${e?.message || e}`);
+  // The most common cause is that the Supabase direct-connection host
+  // only has AAAA records on this network (e.g. Render free tier has
+  // no IPv6 route). The fix is to use the Supabase pooler URL
+  // (Transaction mode, port 6543) instead of the direct connection
+  // (port 5432). The pooler hostname resolves to IPv4 from more
+  // networks and is the recommended connection for serverless hosts.
+  const hint = (e?.code === 'ENODATA' || /ENODATA/.test(e?.message || ''))
+    ? ' The Supabase direct-connection hostname has no A records from this network. Use the Transaction-mode pooler URL (port 6543) from Supabase Settings -> Database -> Connection string instead.'
+    : '';
+  throw new Error(`[db:supabase] failed to resolve ${u.hostname} to IPv4: ${e?.message || e}.${hint}`);
 }
 
 const pool = new Pool({
