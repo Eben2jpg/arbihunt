@@ -4,6 +4,9 @@
   "outputDirectory": "dist",
   "installCommand": "npm install --workspaces=false --include-workspace-root --foreground-scripts",
   "framework": null,
+  "env": {
+    "VITE_API_URL": "https://arbihunt-server.onrender.com"
+  },
   "rewrites": [
     { "source": "/(.*)", "destination": "/index.html" }
   ],

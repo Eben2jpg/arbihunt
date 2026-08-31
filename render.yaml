@@ -30,7 +30,7 @@ services:
       # Where the React app is hosted. Update this after Vercel gives
       # you a URL, then redeploy.
       - key: CLIENT_ORIGIN
-        value: https://arbihunt.vercel.app
+        value: https://arbihunt-client-eben.vercel.app
       # Bind to all interfaces inside the container.
       - key: HOST
         value: 0.0.0.0
