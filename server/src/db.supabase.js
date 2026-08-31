@@ -33,6 +33,12 @@ const pool = new Pool({
   max: 10,
   idleTimeoutMillis: 30_000,
   connectionTimeoutMillis: 8_000,
+  // Force IPv4. Render's free-tier network has no IPv6 route to
+  // Supabase's direct-connection host, and node-postgres prefers
+  // IPv6 when DNS returns both A and AAAA records — which would
+  // leave us with ENETUNREACH. Pinning to 4 makes it skip AAAA
+  // and use the A record.
+  family: 4,
 });
 
 pool.on('error', (e) => console.warn('[db:supabase] idle client error:', e.message));
