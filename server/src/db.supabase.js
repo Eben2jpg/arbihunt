@@ -13,6 +13,7 @@
 // from db.js selectors unchanged.
 
 import pg from 'pg';
+import dns from 'node:dns/promises';
 
 const { Pool } = pg;
 
@@ -26,19 +27,52 @@ if (!connectionString) {
 pg.types.setTypeParser(20, (val) => (val == null ? null : Number(val)));
 pg.types.setTypeParser(1114, (val) => val); // keep timestamps as strings
 
+// Parse the connection string with the WHATWG URL parser (built into
+// Node, no extra dep) so we can resolve the host to an IPv4 address
+// at boot and pass it directly to the pool.
+//
+// Why this matters: when `Pool` is given a `connectionString` it
+// re-resolves the host on every new connection using its own DNS path,
+// and `pg` defaults to looking up both A and AAAA records, preferring
+// IPv6. Render's free-tier network has no IPv6 route to Supabase's
+// AWS-hosted hosts, so the connection fails with ENETUNREACH before
+// it ever tries the A record.
+//
+// Resolving once at boot and passing the literal IP as `host` makes
+// the connection bypass DNS entirely.
+const u = new URL(connectionString);
+const dbUser = decodeURIComponent(u.username);
+const dbPass = decodeURIComponent(u.password);
+const dbName = u.pathname.replace(/^\//, '') || 'postgres';
+const dbPort = u.port ? Number(u.port) : 5432;
+
+let ipv4Host;
+try {
+  const addrs = await dns.resolve4(u.hostname);
+  if (!addrs.length) throw new Error('no A records returned');
+  ipv4Host = addrs[0];
+  console.log(`[db:supabase] resolved ${u.hostname} -> ${ipv4Host}`);
+} catch (e) {
+  throw new Error(`[db:supabase] failed to resolve ${u.hostname} to IPv4: ${e?.message || e}`);
+}
+
 const pool = new Pool({
-  connectionString,
+  host: ipv4Host,
+  port: dbPort,
+  user: dbUser,
+  password: dbPass,
+  database: dbName,
+  // Always force IPv4 so any future lookups inside the driver stay
+  // on the same family. (Currently unused because host is a literal
+  // IP, but defensive in case pg ever re-resolves.)
+  family: 4,
   // Keep idle connections alive so the pool doesn't reset every request
   // through the Supabase pooler. max 10 is plenty for one Node process.
   max: 10,
   idleTimeoutMillis: 30_000,
   connectionTimeoutMillis: 8_000,
-  // Force IPv4. Render's free-tier network has no IPv6 route to
-  // Supabase's direct-connection host, and node-postgres prefers
-  // IPv6 when DNS returns both A and AAAA records — which would
-  // leave us with ENETUNREACH. Pinning to 4 makes it skip AAAA
-  // and use the A record.
-  family: 4,
+  // Supabase requires SSL.
+  ssl: { rejectUnauthorized: false },
 });
 
 pool.on('error', (e) => console.warn('[db:supabase] idle client error:', e.message));
