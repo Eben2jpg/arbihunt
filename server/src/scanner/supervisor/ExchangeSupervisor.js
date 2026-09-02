@@ -67,20 +67,24 @@ export class ExchangeSupervisor {
     if (prunedBooks || prunedLive) {
       console.log(`[supervisor] prune: removed ${prunedBooks} stale book entries, ${prunedLive} stale live books`);
     }
-    // Memory-pressure check. If we are at 80% of the heap, force a
-    // more aggressive prune on every agent.
+    // Memory-pressure check. 70% threshold: trigger an aggressive
+    // prune early enough to avoid the OOM kill. The OOM happens
+    // fast (within seconds) once the heap is over 90%, so we
+    // need to react before that.
     const mem = process.memoryUsage();
     const heapMB = Math.round(mem.heapUsed / 1024 / 1024);
     const heapLimitMB = Math.round(mem.heapTotal / 1024 / 1024);
-    if (heapLimitMB > 0 && heapMB / heapLimitMB > 0.8) {
-      console.warn(`[supervisor] high memory: ${heapMB}MB / ${heapLimitMB}MB heap — aggressive prune`);
+    const rssMB = Math.round(mem.rss / 1024 / 1024);
+    if (heapLimitMB > 0 && heapMB / heapLimitMB > 0.7) {
+      console.warn(`[supervisor] high memory: ${heapMB}MB / ${heapLimitMB}MB heap, ${rssMB}MB rss — aggressive prune`);
       for (const agent of this.agents.values()) {
         if (agent.state === AgentState.SHUTDOWN) continue;
         agent.bookCache.clear();
         agent.liveBook.clear();
+        agent.feeCache.clear();
       }
     }
-    return { prunedBooks, prunedLive, heapMB, heapLimitMB };
+    return { prunedBooks, prunedLive, heapMB, heapLimitMB, rssMB };
   }
 
   // Sequential boot. Each agent loads its market list one after the

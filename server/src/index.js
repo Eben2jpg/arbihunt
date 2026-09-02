@@ -191,9 +191,11 @@ async function startScanner() {
       supervisor.startWatchers(['BTC', 'ETH', 'SOL', 'XRP', 'BNB', 'DOGE', 'ADA', 'AVAX', 'LINK', 'TON']);
     })
     .catch((e) => console.error('[supervisor] init failed:', e?.message || e));
-  // Memory hygiene: every 5 minutes, prune stale LRU + WS entries
-  // and check heap pressure. Cheap, never throws.
-  setInterval(() => { try { supervisor.pruneStale(); } catch (_) {} }, 5 * 60 * 1000).unref();
+  // Memory hygiene: every 60 seconds, prune stale LRU + WS entries
+  // and check heap pressure. Cheap, never throws. 60s interval
+  // (not 5 min) because the OOM can hit within a few minutes when
+  // many agents are streaming WS frames at high frequency.
+  setInterval(() => { try { supervisor.pruneStale(); } catch (_) {} }, 60 * 1000).unref();
   await tick();
   const loop = async () => {
     await tick();

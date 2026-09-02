@@ -56,6 +56,11 @@ const FEES_TIMEOUT_MS = 8_000;
 const BOOK_CACHE_MAX = 256;          // per-agent LRU book cache
 const BOOK_CACHE_TTL_MS = 90_000;    // 90s, matches the old engine
 const FEE_CACHE_TTL_MS = 30 * 60_000; // 30 minutes; fees are slow-moving
+// Cap on per-agent WS liveBook Map. Each entry is a 20-level book
+// (~5-10 KB) so 100 entries is ~1 MB per agent × 36 agents = 36 MB
+// worst case. The Map evicts the oldest entry on every overflow
+// write, so the working set stays bounded even with rapid WS frames.
+const LIVE_BOOK_MAX = 100;
 
 // Cap hot bases streamed per agent. Smaller than the old global cap
 // because each agent is now its own budget.
@@ -363,6 +368,21 @@ export class ExchangeAgent {
     return b;
   }
 
+  // Bounded write to liveBook. Drops the oldest entry when the cap
+  // is exceeded so the working set stays bounded under high WS
+  // frame rates. Without this cap, 40 hot bases streaming 5 frames/s
+  // accumulates thousands of entries over 30 minutes and OOMs the
+  // process when combined with the other per-agent state.
+  _setLiveBook(base, value) {
+    if (this.liveBook.size >= LIVE_BOOK_MAX && !this.liveBook.has(base)) {
+      // Drop the oldest entry. Map iteration order is insertion
+      // order, so the first key is the oldest.
+      const oldest = this.liveBook.keys().next().value;
+      if (oldest !== undefined) this.liveBook.delete(oldest);
+    }
+    this.liveBook.set(base, value);
+  }
+
   async _runWatchLoop() {
     while (this._wsRunning && !this._stopped) {
       this._wsAbort = new AbortController();
@@ -378,7 +398,7 @@ export class ExchangeAgent {
             'watchOrderBook'
           );
           if (book && book.bids && book.asks) {
-            this.liveBook.set(base, {
+            this._setLiveBook(base, {
               bids: book.bids.slice(0, 20),
               asks: book.asks.slice(0, 20),
               timestamp: Date.now(),

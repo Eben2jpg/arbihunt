@@ -12,6 +12,21 @@ import { sendEmail, passwordResetEmail } from '../mailer.js';
 const authLimiter = rateLimit({ windowMs: 60_000, max: 20 });
 const resetLimiter = rateLimit({ windowMs: 60_000, max: 5 });
 
+// Hard 5s ceiling on every Supabase call in auth routes. Without
+// this, a slow Supabase connection from Render's free tier can
+// hang the request until Render's edge returns a 502 with HTML,
+// which the frontend's axios reports as a "Network Error".
+// With this race, the route returns a clean 503 within 5s.
+function withDbTimeout(promise, ms = 5000) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`db timeout after ${ms}ms`)), ms);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
 const router = express.Router();
 
 router.post('/register', authLimiter, async (req, res) => {
@@ -19,24 +34,35 @@ router.post('/register', authLimiter, async (req, res) => {
     const { email, password, referredBy } = req.body || {};
     if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
     if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
-    if (await getUserByEmail(email)) return res.status(409).json({ error: 'Email already registered' });
+    let existing;
+    try { existing = await withDbTimeout(getUserByEmail(email)); }
+    catch (e) { return res.status(503).json({ error: 'Database temporarily unavailable, please retry' }); }
+    if (existing) return res.status(409).json({ error: 'Email already registered' });
 
     const user = await createUser({ email, passwordHash: hashPassword(password), referredBy });
     const token = makeToken(user.id);
     res.json({ token, user: serializeUser(user) });
-  } catch (e) { res.status(500).json({ error: 'Registration failed' }); }
+  } catch (e) {
+    console.error('[auth] register error:', e?.message || e);
+    res.status(500).json({ error: 'Registration failed' });
+  }
 });
 
 router.post('/login', authLimiter, async (req, res) => {
   try {
     const { email, password } = req.body || {};
-    const user = await getUserByEmail(email);
+    let user;
+    try { user = await withDbTimeout(getUserByEmail(email)); }
+    catch (e) { return res.status(503).json({ error: 'Database temporarily unavailable, please retry' }); }
     if (!user || !verifyPassword(password, user.password_hash)) {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
     const token = makeToken(user.id);
     res.json({ token, user: serializeUser(user) });
-  } catch (e) { res.status(500).json({ error: 'Login failed' }); }
+  } catch (e) {
+    console.error('[auth] login error:', e?.message || e);
+    res.status(500).json({ error: 'Login failed' });
+  }
 });
 
 router.post('/change-password', authRequired, async (req, res) => {
@@ -66,10 +92,15 @@ router.get('/me', async (req, res) => {
     if (!token) return res.status(401).json({ error: 'Not authenticated' });
     const userId = verifyToken(token);
     if (!userId) return res.status(401).json({ error: 'Invalid token' });
-    const user = await getUserById(userId);
+    let user;
+    try { user = await withDbTimeout(getUserById(userId)); }
+    catch (e) { return res.status(503).json({ error: 'Database temporarily unavailable' }); }
     if (!user) return res.status(401).json({ error: 'Account not found' });
     res.json({ user: serializeUser(user) });
-  } catch (e) { res.status(500).json({ error: 'Auth check failed' }); }
+  } catch (e) {
+    console.error('[auth] me error:', e?.message || e);
+    res.status(500).json({ error: 'Auth check failed' });
+  }
 });
 
 router.post('/forgot-password', resetLimiter, async (req, res) => {

@@ -190,3 +190,18 @@ test('memory: 60s of operation does not grow beyond cache ceiling', async () => 
   }
   sup.shutdown();
 });
+
+test('liveBook map is capped to prevent OOM', async () => {
+  const sup = new ExchangeSupervisor({ exchanges: makeExchanges() });
+  await sup.init();
+  const good = sup.agents.get('good0');
+  // Write 250 distinct base entries directly via the internal helper.
+  // The cap is 100, so the oldest 150 should be evicted.
+  for (let i = 0; i < 250; i++) {
+    good._setLiveBook(`BASE${i}`, { bids: [[100, 1]], asks: [[101, 1]], timestamp: Date.now() });
+  }
+  assert.ok(good.liveBook.size <= 100, `liveBook exceeded cap: ${good.liveBook.size}`);
+  // The most recent entry should still be there.
+  assert.ok(good.liveBook.has('BASE249'), 'most recent entry should be present');
+  sup.shutdown();
+});
