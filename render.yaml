@@ -2,8 +2,12 @@
 # Deploy: render.com -> New -> Blueprint -> point at this repo.
 #
 # Two services on Render, both from this repo:
-#   1) arbihunt-server  — Web Service (Node, scanner + API + WebSocket)
-#   2) arbihunt-client  — Static Site (Vite-built React SPA)
+#   1) arbihunt-3  — Web Service (Node, scanner + API + WebSocket)
+#   2) arbihunt-4  — Static Site (Vite-built React SPA)
+#
+# The /api/* and /ws paths on the static site are rewrites (server-side
+# proxy) to the backend so the browser stays on the static-site origin
+# and no CORS surface is exposed.
 #
 # The 36-exchange scanner runs in a long-lived Node process; the WS
 # upgrade path needs a Web Service (serverless functions do not
@@ -21,8 +25,9 @@
 
 services:
   # ---- Backend: scanner + REST API + WebSocket ----
+  # Live deploy name on Render: arbihunt-3 (this account's existing Web Service).
   - type: web
-    name: arbihunt-server
+    name: arbihunt-3
     runtime: node
     rootDir: server
     plan: free
@@ -41,10 +46,10 @@ services:
         generateValue: true
       - key: NODE_ENV
         value: production
-      # Frontend origin. Update this after the Static Site's first
-      # deploy gives you a `*.onrender.com` URL.
+      # Frontend origin (the Static Site deployed on the same account).
+      # Used by the CORS allowlist in server/src/index.js.
       - key: CLIENT_ORIGIN
-        value: https://arbihunt-client.onrender.com
+        value: https://arbihunt-4.onrender.com
       - key: HOST
         value: 0.0.0.0
       - key: OWNER_EMAIL
@@ -73,18 +78,29 @@ services:
         value: "1000"
 
   # ---- Frontend: Vite-built React SPA, served as static assets ----
+  # Live deploy name on Render: arbihunt-4 (this account's existing Static Site).
   - type: static
-    name: arbihunt-client
+    name: arbihunt-4
     rootDir: client
     # Vite's `build` script produces a static bundle in `dist/`.
     # Render Static Sites serve whatever is in `staticPublishPath`
-    # exactly as-is, with SPA fallback to index.html so React
-    # Router's client-side routes resolve on refresh.
+    # exactly as-is.
     buildCommand: npm install && npm run build
     staticPublishPath: dist
-    # SPA fallback: any unknown path returns index.html so React
-    # Router can take over. Without this, /opportunities would 404.
+    # Routes. Order matters — the more specific rewrites come first.
+    # 1) /api/<path> proxied to the backend Web Service so the
+    #    browser stays on the static-site origin (no CORS).
+    # 2) /ws proxied to the backend's WebSocket endpoint. Render's
+    #    rewrite engine supports WS upgrades.
+    # 3) SPA fallback: any unknown path returns index.html so React
+    #    Router can take over. Without this, /dashboard would 404.
     routes:
+      - type: rewrite
+        source: /api/*
+        destination: https://arbihunt-3.onrender.com/api/*
+      - type: rewrite
+        source: /ws
+        destination: https://arbihunt-3.onrender.com/ws
       - type: rewrite
         source: /*
         destination: /index.html
@@ -92,12 +108,11 @@ services:
 
     envVars:
       # Vite reads import.meta.env.VITE_API_URL at build time and
-      # bakes it into the bundle. Update this after the backend's
-      # first deploy gives you its `*.onrender.com` URL. No trailing
-      # slash. The same value is used for the WebSocket URL — the
-      # client replaces http(s) with ws(s) automatically.
+      # bakes it into the bundle. The client/src/api.jsx module
+      # resolves API_BASE and WS_URL from this single env var. No
+      # trailing slash.
       - key: VITE_API_URL
-        value: https://arbihunt-server.onrender.com
+        value: https://arbihunt-3.onrender.com
 
     headers:
       # Long cache for hashed assets (Vite emits /assets/<hash>).
