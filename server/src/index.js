@@ -3,18 +3,44 @@ import cors from 'cors';
 import http from 'http';
 import { WebSocketServer } from 'ws';
 import { config } from './config.js';
-import { runScan, getLatestOpportunities, getScanStats } from './scanner/engine.js';
+import { runScan, runScanV2, getLatestOpportunities, getScanStats } from './scanner/engine.js';
 import { fetchTronTransfers, fetchBscTransfers, getLatestBlockNumber, getConfirmations } from './payments/monitor.js';
 import { getPendingPayments, updatePaymentStatus } from './db.js';
 import { activatePayment } from './payments/activate.js';
 import { liveExchanges as exchanges } from './scanner/exchanges.js';
 import { loadMarkets as loadExchangeMarkets, cacheMarkets as cacheMarketsToDb } from './scanner/markets.js';
 import { refreshLiveFees, liveFeesStats } from './scanner/liveFees.js';
+import { ExchangeSupervisor } from './scanner/supervisor/ExchangeSupervisor.js';
+import { setSupervisor } from './supervisor-bridge.js';
+
+// The supervisor owns the 36 ExchangeAgent instances. It boots
+// sequentially, runs WS watchers independently per exchange, and
+// exposes a health snapshot the dashboard can poll. The current
+// engine still talks to the legacy code paths during the migration
+// — once Phase 2 lands, the engine will read from the supervisor
+// instead of ccxt directly.
+const supervisor = new ExchangeSupervisor({
+  exchanges,
+  onStateChange: (agent, prev, next) => {
+    // Surface per-agent transitions on the existing broadcast channel
+    // so the dashboard can light up individual exchange dots live.
+    broadcast({
+      type: 'exchange',
+      id: agent.id,
+      name: agent.name,
+      prev,
+      next,
+      reason: agent.stateReason,
+      timestamp: Date.now(),
+    });
+  },
+});
+setSupervisor(supervisor);
 
 const app = express();
 // CORS: in production, allow the configured CLIENT_ORIGIN (and any
-// Vercel preview URL). In dev, allow any origin so the Vite proxy +
-// a local network device both work.
+// Vercel or Render preview URL). In dev, allow any origin so the
+// Vite proxy + a local network device both work.
 const allowedOrigins = (config.clientOrigin || '')
   .split(',')
   .map((s) => s.trim())
@@ -28,6 +54,8 @@ app.use(
       if (allowedOrigins.includes(origin)) return cb(null, true);
       // Vercel preview URLs look like https://arbihunt-<hash>.vercel.app
       if (/^https:\/\/[\w-]+\.vercel\.app$/.test(origin)) return cb(null, true);
+      // Render preview URLs look like https://arbihunt-client-<hash>.onrender.com
+      if (/^https:\/\/[\w-]+\.onrender\.com$/.test(origin)) return cb(null, true);
       return cb(new Error('CORS: origin not allowed: ' + origin));
     },
     credentials: true,
@@ -89,6 +117,7 @@ app.get('/api/ticker', (_req, res) => {
   const opps = getLatestOpportunities();
   const bases = new Set();
   for (const o of opps) if (o.base) bases.add(o.base);
+  const health = (() => { try { return supervisor.healthReport(); } catch (_) { return null; } })();
   res.json({
     timestamp: Date.now(),
     lastScanAt: stats.lastScanAt,
@@ -100,6 +129,7 @@ app.get('/api/ticker', (_req, res) => {
     opportunityCount: opps.length,
     opportunityBases: [...bases],
     live: stats.live,
+    exchangeHealth: health ? { healthy: health.healthy, total: health.total, byState: health.byState } : null,
   });
 });
 
@@ -110,7 +140,9 @@ const ERROR_BACKOFF_MS = 5000;
 async function tick() {
   console.log('[scan] starting...');
   try {
-    const result = await runScan(config);
+    // V2 reads from the supervisor (36 isolated agents). Falls back
+    // to v1 if the supervisor hasn't booted yet.
+    const result = await runScanV2(config);
     consecutiveErrors = 0; // a successful cycle resets the counter
     const stats = getScanStats();
     console.log(`[scan] ${stats.count} opps in ${stats.durationMs}ms across ${stats.exchanges} exchanges`);
@@ -148,12 +180,41 @@ async function startScanner() {
   refreshLiveFees(exchanges.map((e) => ({ id: e.id, client: e.client })))
     .then((stats) => console.log(`[livefees] refreshed: reachable=${stats.reachable}/${stats.reachable + stats.unreachable} coins=${stats.coins} networks=${stats.networks}`))
     .catch((e) => console.log('[livefees] refresh failed:', e.message));
+  // In parallel, boot the supervisor: 36 isolated ExchangeAgents,
+  // each with its own FSM, circuit breaker, and per-agent caches.
+  // A failure on one agent cannot stop the others from booting.
+  supervisor.init()
+    .then((report) => {
+      console.log(`[supervisor] ${report.healthy}/${report.total} healthy, byState=${JSON.stringify(report.byState)}`);
+      // Start WS watchers once boot is done. Hot bases start with the
+      // majors; the engine will update them after every scan.
+      supervisor.startWatchers(['BTC', 'ETH', 'SOL', 'XRP', 'BNB', 'DOGE', 'ADA', 'AVAX', 'LINK', 'TON']);
+    })
+    .catch((e) => console.error('[supervisor] init failed:', e?.message || e));
+  // Memory hygiene: every 5 minutes, prune stale LRU + WS entries
+  // and check heap pressure. Cheap, never throws.
+  setInterval(() => { try { supervisor.pruneStale(); } catch (_) {} }, 5 * 60 * 1000).unref();
   await tick();
   const loop = async () => {
     await tick();
+    // Push the current hot-bases (from the latest opportunities) to
+    // every agent's WS watcher so the streamed set stays relevant.
+    try { supervisor.updateHotBases(latestHotBases()); } catch (_) {}
     scanTimer = setTimeout(loop, config.scanIntervalMs);
   };
   scanTimer = setTimeout(loop, config.scanIntervalMs);
+}
+
+// Hot bases the WS layer should stream. Mirrors the old MAJOR_BASES
+// list plus anything the engine surfaced as a real opportunity in the
+// most recent scan. Bounded to 40.
+function latestHotBases() {
+  const set = new Set(['BTC', 'ETH', 'SOL', 'XRP', 'BNB', 'DOGE', 'ADA', 'AVAX', 'LINK', 'TON']);
+  for (const o of getLatestOpportunities()) {
+    if (o && o.base) set.add(String(o.base).toUpperCase());
+    if (set.size >= 40) break;
+  }
+  return [...set];
 }
 
 async function prewarmMarketCache() {
@@ -177,7 +238,27 @@ async function prewarmMarketCache() {
   await Promise.all(workers);
 }
 
+// Per-agent FSM snapshot. Powers the dashboard's exchange-health
+// grid and is also useful for the admin panel.
+function _getHealthReport() { try { return supervisor.healthReport(); } catch (_) { return null; } }
+app.get('/api/status/exchanges', (_req, res) => {
+  const report = _getHealthReport();
+  if (!report) return res.status(503).json({ error: 'supervisor not ready' });
+  res.json(report);
+});
+
 startScanner();
+
+// Drain the supervisor cleanly on shutdown so WS sockets and timers
+// don't outlive the process.
+function shutdown(reason) {
+  console.log(`[shutdown] ${reason} — draining supervisor`);
+  try { supervisor.shutdown(); } catch (_) {}
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(1), 5000).unref();
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
 
 async function monitorPayments() {
   try {

@@ -8,7 +8,32 @@ const API_BASE = import.meta.env.VITE_API_URL
   ? `${import.meta.env.VITE_API_URL.replace(/\/+$/, '')}/api`
   : '/api';
 
-export const api = axios.create({ baseURL: API_BASE });
+// axios instance with a generous timeout and one retry on network
+// errors. Render's free tier cold-starts can take up to 50s, so the
+// first request after a sleep often fails with ECONNREFUSED or
+// ETIMEDOUT; a single retry is enough to ride out that window.
+export const api = axios.create({
+  baseURL: API_BASE,
+  timeout: 15_000,
+});
+api.interceptors.response.use(
+  (r) => r,
+  async (err) => {
+    const cfg = err?.config;
+    if (!cfg || cfg.__retry) throw err;
+    // Retry only on transport-level failures, never on 4xx.
+    const isTransport = !err.response && (
+      err.code === 'ECONNABORTED' ||
+      err.code === 'ECONNREFUSED' ||
+      err.code === 'ETIMEDOUT' ||
+      err.message === 'Network Error'
+    );
+    if (!isTransport) throw err;
+    cfg.__retry = true;
+    await new Promise((r) => setTimeout(r, 1500));
+    return api.request(cfg);
+  }
+);
 
 // WebSocket URL — used by the dashboard for live opportunity pushes.
 // Same env var as the HTTP API; the dashboard falls back to the current
@@ -19,6 +44,67 @@ export const WS_URL = (() => {
   const u = v.replace(/^http/, 'ws').replace(/\/+$/, '');
   return `${u}/ws`;
 })();
+
+// Reconnecting WebSocket helper. Returns an object with `socket`,
+// `addEventListener`, and `close`. Reconnects with exponential
+// backoff (1s -> 30s cap) on close/error, and resets the backoff on
+// every successful open. Render's free tier sleeps the Web Service
+// after 15 min idle, so the WS will drop; this wrapper brings it
+// back automatically.
+export function createReconnectingWS(url) {
+  let ws = null;
+  const listeners = new Map();
+  let backoffMs = 1000;
+  let closedByUser = false;
+  const open = () => {
+    if (closedByUser) return;
+    try {
+      ws = new WebSocket(url);
+    } catch (e) {
+      scheduleReconnect();
+      return;
+    }
+    ws.addEventListener('open', () => {
+      backoffMs = 1000;
+      emit('open');
+    });
+    ws.addEventListener('message', (ev) => emit('message', ev));
+    ws.addEventListener('close', () => {
+      emit('close');
+      scheduleReconnect();
+    });
+    ws.addEventListener('error', () => {
+      // 'close' will fire right after, so let it handle the reconnect.
+      emit('error');
+    });
+  };
+  const scheduleReconnect = () => {
+    if (closedByUser) return;
+    const wait = backoffMs;
+    backoffMs = Math.min(backoffMs * 2, 30_000);
+    setTimeout(open, wait);
+  };
+  const emit = (type, ev) => {
+    const set = listeners.get(type);
+    if (set) for (const fn of set) { try { fn(ev); } catch (_) {} }
+  };
+  open();
+  return {
+    get socket() { return ws; },
+    addEventListener(type, fn) {
+      if (!listeners.has(type)) listeners.set(type, new Set());
+      listeners.get(type).add(fn);
+    },
+    removeEventListener(type, fn) {
+      const set = listeners.get(type);
+      if (set) set.delete(fn);
+    },
+    close() {
+      closedByUser = true;
+      if (ws) try { ws.close(); } catch (_) {}
+    },
+  };
+}
 
 // --- Sliding session (72h of no activity = sign in again) ---
 const LAST_SEEN_KEY = 'arb_last_seen';

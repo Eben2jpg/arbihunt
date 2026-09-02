@@ -6,6 +6,8 @@ import { addScanHistory, isPro } from '../db.js';
 import { FREE_MAX_SPREAD_PERCENT } from '../constants.js';
 import { ensureWatchers, refreshSymbolMaps, getLiveBook, updateHotBases, liveStats } from './liveBooks.js';
 import { routeIsOpen } from './liveFees.js';
+import { getSupervisor } from '../supervisor-bridge.js';
+import { AgentState } from './supervisor/ExchangeAgent.js';
 
 // Smaller trade size lets the scanner include lower-priced / thinner tokens
 // that still have real, tradeable liquidity.
@@ -19,13 +21,22 @@ const ORDER_BOOK_TIMEOUT_MS = 6000;
 const MARKETS_TIMEOUT_MS = 10000; // markets.js has its own ceiling; this is the
                                   // outer race so a single slow exchange can
                                   // never stretch the whole cycle.
-const FETCH_CONCURRENCY = 64;
+const FETCH_CONCURRENCY = 32;
 // Cap each exchange to the top N bases per cycle. Beyond this the books
 // become progressively thinner and the per-symbol cost is dominated by
 // timeouts anyway; this keeps the cycle bounded.
-const MAX_BOOKS_PER_EXCHANGE = 2000;
-const MIN_LISTINGS = 1; // every /USDT pair is in scope; the detector filters
-                        // out anything that has no real cross-exchange counter.
+const MAX_BOOKS_PER_EXCHANGE = 400;
+// V2 ceilings: bound the total per-cycle work so a degraded network
+// can't stack up an unbounded queue.
+const MAX_BASES_PER_CYCLE = 1500;       // cap the token universe size
+const MAX_BOOK_FETCHES_PER_CYCLE = 6000; // cap the (base × agent) pairs
+// Only tokens listed on >= 2 exchanges can ever produce a cross-exchange
+// signal. With Render's 512 MB container we can't fan out the full ~6,632
+// token universe across 36 exchanges per cycle; the >1 listing filter
+// drops it to a few hundred cross-listed tokens that are the actual
+// source of every real opportunity. Free-tier hosts in particular OOM
+// the process before the cycle finishes at the full universe.
+const MIN_LISTINGS = 2;
 const PROBE_SYMBOLS = 3;
 // Leveraged tokens ("BTC3L", "ETH3S", ...) exist per-exchange and track that
 // venue's own underlying index — they are NOT the same asset across exchanges
@@ -48,14 +59,13 @@ let lastExchanges = 0;
 let lastScannedExchanges = [];
 let scanning = false;
 
-// Cross-cycle book cache. A residential IP can't always reach all 36
-// venues in a single 25s window — but the cross-listing intersection
-// only needs TWO of them at the same moment. If a venue was reachable
-// last cycle, reuse its books (TTL 90s) when this cycle's fetch fails.
-// This grows the "live exchanges" count effectively without any extra
-// network calls on the happy path.
+// Cross-cycle book cache (LEGACY v1 only). In v2 each ExchangeAgent
+// owns its own bounded LRU. We keep this map here so the v1 fallback
+// path still compiles, but we now back it with the LRU class so a
+// process that runs v1 for an extended period cannot OOM.
+import { LRU } from './cache/LRU.js';
 const BOOK_CACHE_TTL_MS = 90_000;
-const bookCache = new Map(); // key: `${exId}:${base}` -> { book, taker, symbol, ts }
+const bookCache = new LRU({ max: 5000, ttlMs: BOOK_CACHE_TTL_MS }); // key: `${exId}:${base}` -> { book, taker, symbol }
 function cacheKey(exId, base) { return `${exId}:${base}`; }
 
 // Run `worker(item)` over `arr` with a bounded number of concurrent calls.
@@ -100,11 +110,13 @@ async function fetchOrderBookCached(exchangeId, ex, t) {
   }
   const book = await fetchOrderBook(ex.client, t.symbol);
   if (book) {
-    bookCache.set(cacheKey(exchangeId, t.base), { book, taker: t.taker, symbol: t.symbol, ts: Date.now() });
+    // LRU manages the timestamp internally; the value is just {book, taker, symbol}.
+    bookCache.set(cacheKey(exchangeId, t.base), { book, taker: t.taker, symbol: t.symbol });
     return { base: t.base, symbol: t.symbol, book, taker: t.taker, fromCache: false };
   }
+  // LRU.get() returns null if the entry is past TTL — no need to recheck here.
   const cached = bookCache.get(cacheKey(exchangeId, t.base));
-  if (cached && Date.now() - cached.ts <= BOOK_CACHE_TTL_MS) {
+  if (cached) {
     return { base: t.base, symbol: cached.symbol, book: cached.book, taker: cached.taker, fromCache: true };
   }
   return null;
@@ -431,7 +443,7 @@ export async function runScan(config, options = {}) {
             const live = getLiveBook(ex.id, t.base);
             if (live) return { base: t.base, symbol: t.symbol, book: live, taker: t.taker, fromCache: false };
             const cached = bookCache.get(cacheKey(ex.id, t.base));
-            if (cached && Date.now() - cached.ts <= BOOK_CACHE_TTL_MS) {
+            if (cached) {
               return { base: t.base, symbol: cached.symbol, book: cached.book, taker: cached.taker, fromCache: true };
             }
             return null;
@@ -470,6 +482,144 @@ export async function runScan(config, options = {}) {
     addScanHistory(latestOpportunities.length, durationMs, Object.keys(booksByExchange).length).catch((e) => console.warn('[scan] addScanHistory failed:', e?.message || e));
     console.log(`[scan] ${latestOpportunities.length} opps from ${universe.length} tokens in ${durationMs}ms`);
     return { opportunities: latestOpportunities, durationMs, exchanges: Object.keys(booksByExchange).length, tokens: universe.length };
+  } finally {
+    scanning = false;
+  }
+}
+
+// Supervisor-driven scan. Reads ALL data (markets, books, WS live)
+// from the ExchangeSupervisor — no direct ccxt calls, no shared
+// Promise.all over exchange arrays. A failure on one agent cannot
+// affect the cycle: the agent itself catches and isolates.
+//
+// Per-agent work is parallelised via Promise.allSettled over a
+// list of agent-only tasks, so the cycle wall-clock is bounded by
+// the SLOWEST healthy agent, not the sum of all agents.
+export async function runScanV2(config, options = {}) {
+  if (scanning) {
+    console.log('[scan] still running, tick skipped');
+    return { skipped: true };
+  }
+  scanning = true;
+  const start = Date.now();
+
+  try {
+    const supervisor = getSupervisor();
+    if (!supervisor) {
+      console.log('[scan:v2] supervisor not ready, falling back to v1');
+      return await runScan(config, options);
+    }
+
+    // 1. Universe from the supervisor's healthy agents only. A dead
+    //    exchange's tokens are simply not in the universe this cycle.
+    const allMarkets = supervisor.getMarketsSnapshot();
+    const baseSet = new Set();
+    for (const m of allMarkets) if (m.base) baseSet.add(m.base);
+    let universe = buildUniverse(baseSet);
+    if (!universe.length) {
+      console.log('[scan:v2] no live markets — skipping');
+      scansDone++;
+      lastScanAt = Date.now();
+      latestOpportunities = [];
+      lastTokenCount = 0;
+      return { opportunities: [], durationMs: Date.now() - start, exchanges: 0, tokens: 0 };
+    }
+
+    // 2. Cross-listing filter: token must be on >= MIN_LISTINGS healthy
+    //    agents. This is the same filter as v1, but counts are derived
+    //    from the supervisor's view of the world, not from ccxt
+    //    directly.
+    const listingCount = new Map();
+    for (const m of allMarkets) {
+      listingCount.set(m.base, (listingCount.get(m.base) || 0) + 1);
+    }
+    const before = universe.length;
+    universe = universe.filter((b) => (listingCount.get(b) || 0) >= MIN_LISTINGS);
+    console.log(`[scan:v2] universe filtered ${before} -> ${universe.length} (>=${MIN_LISTINGS} listings)`);
+
+    // Optional: per-user exchange selection
+    const selectedSet = (options.selectedExchanges && options.selectedExchanges.length)
+      ? new Set(options.selectedExchanges)
+      : null;
+
+    // 3. Per-agent book fetch. Each agent enforces its OWN timeout
+    //    and circuit-breaker state. If the agent's breaker is open,
+    //    fetchOrderBookSafe() returns { ok: false, error: 'backoff' }
+    //    in <1ms — no network call, no shared stall.
+    const tasks = [];
+    for (const base of universe.slice(0, MAX_BASES_PER_CYCLE)) {
+      for (const agent of supervisor.agents.values()) {
+        if (agent.state === AgentState.SHUTDOWN || agent.state === AgentState.UNSUPPORTED) continue;
+        if (selectedSet && !selectedSet.has(agent.id)) continue;
+        const market = agent.marketsByBase.get(base);
+        if (!market) continue;
+        tasks.push({ agent, base, symbol: market.symbol });
+      }
+    }
+    // Bound the total per cycle. With 36 agents × 6632 bases this
+    // would be ~240k fetch attempts; we cap at 6000 to keep the
+    // cycle under 25s on a good network.
+    if (tasks.length > MAX_BOOK_FETCHES_PER_CYCLE) {
+      tasks.length = MAX_BOOK_FETCHES_PER_CYCLE;
+    }
+
+    // 4. Execute tasks via bounded pool, but each task is fully
+    //    isolated by the agent. A throw inside one agent cannot
+    //    affect another agent's task.
+    const booksByExchange = {};
+    const poolSize = Math.min(FETCH_CONCURRENCY, tasks.length);
+    let next = 0;
+    const workers = Array.from({ length: poolSize }, async () => {
+      while (next < tasks.length) {
+        const idx = next++;
+        const t = tasks[idx];
+        const r = await t.agent.fetchOrderBookSafe(t.symbol);
+        if (!r.ok) continue;
+        if (!booksByExchange[t.agent.id]) booksByExchange[t.agent.id] = [];
+        booksByExchange[t.agent.id].push({
+          base: t.base,
+          symbol: t.symbol,
+          book: r.value,
+          taker: t.agent.marketsByBase.get(t.base)?.taker || 0.001,
+          minAmount: t.agent.marketsByBase.get(t.base)?.limits?.amount?.min || 0,
+        });
+      }
+    });
+    await Promise.allSettled(workers);
+
+    // 5. Detect. The detect function is unchanged.
+    const detected = detectOpportunities(booksByExchange, options).slice(0, config.maxOpportunities);
+
+    // 6. Volume enrichment. Uses the supervisor's clients so we
+    //    benefit from the same connection pool.
+    const exchangeMap = {};
+    for (const agent of supervisor.agents.values()) {
+      if (agent.client) exchangeMap[agent.id] = { client: agent.client, id: agent.id };
+    }
+    let result = detected;
+    try { result = await enrichVolumes(detected, exchangeMap); } catch (e) {
+      console.warn('[scan:v2] enrichVolumes failed:', e?.message || e);
+    }
+
+    latestOpportunities = result;
+    scansDone++;
+    lastScanAt = Date.now();
+    lastTokenCount = universe.length;
+    const durationMs = Date.now() - start;
+    lastDurationMs = durationMs;
+    lastExchanges = Object.keys(booksByExchange).length;
+    lastScannedExchanges = Object.keys(booksByExchange);
+    updateHotBases(latestOpportunities.map((o) => o.base));
+
+    addScanHistory(latestOpportunities.length, durationMs, Object.keys(booksByExchange).length)
+      .catch((e) => console.warn('[scan] addScanHistory failed:', e?.message || e));
+    console.log(`[scan:v2] ${latestOpportunities.length} opps from ${universe.length} tokens in ${durationMs}ms across ${lastExchanges} exchanges`);
+    return { opportunities: latestOpportunities, durationMs, exchanges: lastExchanges, tokens: universe.length };
+  } catch (e) {
+    // Last-resort safety net. The hot path above never throws
+    // because every component is wrapped, but bugs happen.
+    console.error('[scan:v2] unhandled error:', e?.message || e);
+    return { error: String(e?.message || e), opportunities: latestOpportunities };
   } finally {
     scanning = false;
   }

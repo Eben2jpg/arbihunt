@@ -1,77 +1,111 @@
 # Render Blueprint for ArbiHunt
 # Deploy: render.com -> New -> Blueprint -> point at this repo.
-# Renders one Web Service from /server. The /client is hosted on Vercel
-# (see vercel.json) so the React app and the long-running Node scanner
-# each get the platform that fits them.
 #
-# NOTE: render.yaml syntax is YAML 1.2. Indentation matters.
+# Two services on Render, both from this repo:
+#   1) arbihunt-server  — Web Service (Node, scanner + API + WebSocket)
+#   2) arbihunt-client  — Static Site (Vite-built React SPA)
+#
+# The 36-exchange scanner runs in a long-lived Node process; the WS
+# upgrade path needs a Web Service (serverless functions do not
+# support it). The client is pure static assets, so a Static Site is
+# cheaper and faster than a Web Service.
+#
+# Notes:
+# - Both services on the free plan. Free Web Service spins down after
+#   ~15 min idle; keep it warm with an external ping (UptimeRobot or
+#   similar) hitting the backend's /api/health every ~14 min.
+# - render.yaml syntax is YAML 1.2. Indentation matters.
+# - The 460MB heap cap on the backend matches the free tier's
+#   container limit. Each ExchangeAgent owns a bounded LRU so the
+#   total cache footprint stays well under that ceiling.
 
 services:
+  # ---- Backend: scanner + REST API + WebSocket ----
   - type: web
     name: arbihunt-server
     runtime: node
     rootDir: server
     plan: free
     region: oregon
-    # Run from the existing src/index.js entrypoint. The ws WebSocket
-    # upgrade path requires a long-lived process, which Render Web
-    # Services provide (serverless functions do not).
-    startCommand: node src/index.js
+    # The --max-old-space-size flag caps V8's heap so a runaway
+    # agent cannot push the whole container over the free-tier
+    # 512MB container limit. 460MB leaves headroom for V8 baseline
+    # + RSS overhead.
+    startCommand: node --max-old-space-size=460 src/index.js
     buildCommand: npm install
     healthCheckPath: /api/health
     autoDeploy: true
 
     envVars:
-      # Required: a long random string. Generate with: openssl rand -hex 32
       - key: JWT_SECRET
         generateValue: true
       - key: NODE_ENV
         value: production
-      # Where the React app is hosted. Update this after Vercel gives
-      # you a URL, then redeploy.
+      # Frontend origin. Update this after the Static Site's first
+      # deploy gives you a `*.onrender.com` URL.
       - key: CLIENT_ORIGIN
-        value: https://arbihunt-client-eben.vercel.app
-      # Bind to all interfaces inside the container.
+        value: https://arbihunt-client.onrender.com
       - key: HOST
         value: 0.0.0.0
-      # Optional owner email so the in-app owner panel works.
       - key: OWNER_EMAIL
         sync: false
-      # Supabase Postgres connection string. When set, the server uses
-      # Supabase instead of the local JSON/SQLite file store. Render's
-      # free tier has no persistent disk, so this is the only way to
-      # keep user data durable.
       - key: SUPABASE_DB_URL
         sync: false
-      # USDT receiving addresses (public, fine to put here).
       - key: USDT_TRON_ADDRESS
         sync: false
       - key: USDT_BSC_ADDRESS
         sync: false
-      # Block explorer keys for transaction monitoring.
       - key: TRONGRID_API_KEY
         sync: false
       - key: BSCSCAN_API_KEY
         sync: false
-      # Email (Resend). Leave blank in production; the forgot-password
-      # endpoint will then refuse to expose the reset code in the response.
       - key: RESEND_API_KEY
         sync: false
       - key: EMAIL_FROM
         value: "ArbiHunt <noreply@example.com>"
-      # Force production reset-code flow even if RESEND_API_KEY is blank.
       - key: RESET_CODE_EXPOSED
         value: "false"
-      # Demo seed is permanently off in production.
       - key: ENABLE_DEMO_SEED
         value: "false"
-      # Scanner tuning.
       - key: SCAN_INTERVAL_MS
         value: "25000"
       - key: MAX_OPPORTUNITIES
         value: "1000"
 
-    # No persistent disk: Render's free tier rejects it ("disks are not
-    # supported for free tier services"). User data durability is
-    # provided by Supabase Postgres (see SUPABASE_DB_URL above); the
-    # JSON store only serves as a final-fallback when no DB is configured.
+  # ---- Frontend: Vite-built React SPA, served as static assets ----
+  - type: static
+    name: arbihunt-client
+    rootDir: client
+    # Vite's `build` script produces a static bundle in `dist/`.
+    # Render Static Sites serve whatever is in `staticPublishPath`
+    # exactly as-is, with SPA fallback to index.html so React
+    # Router's client-side routes resolve on refresh.
+    buildCommand: npm install && npm run build
+    staticPublishPath: dist
+    # SPA fallback: any unknown path returns index.html so React
+    # Router can take over. Without this, /opportunities would 404.
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    autoDeploy: true
+
+    envVars:
+      # Vite reads import.meta.env.VITE_API_URL at build time and
+      # bakes it into the bundle. Update this after the backend's
+      # first deploy gives you its `*.onrender.com` URL. No trailing
+      # slash. The same value is used for the WebSocket URL — the
+      # client replaces http(s) with ws(s) automatically.
+      - key: VITE_API_URL
+        value: https://arbihunt-server.onrender.com
+
+    headers:
+      # Long cache for hashed assets (Vite emits /assets/<hash>).
+      - path: /assets/*
+        name: Cache-Control
+        value: public, max-age=31536000, immutable
+      # Never cache the index.html itself so deploys take effect
+      # immediately.
+      - path: /*
+        name: Cache-Control
+        value: no-cache
